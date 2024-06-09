@@ -1,0 +1,796 @@
+---
+title: "Glioma Grading - the Quest for Fewer Features"
+author: "Emelie Wahlstedt"
+date: "2024-06"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: true
+    extra_dependencies: ["float"]
+header-includes:
+  - \usepackage{setspace}
+  - \doublespacing
+  - \usepackage{fontspec}
+  - \setmainfont{Arial}
+  - \usepackage{titlesec}
+  - \usepackage{xcolor}
+  - \titleformat{\section}{\color{teal}\normalfont\Large\bfseries}{\thesection}{1em}{}
+  - \titleformat{\subsection}{\color{darkgray}\normalfont\large\bfseries}{\thesubsection}{1em}{}
+  - \titleformat{\subsubsection}{\color{gray}\normalfont\large\bfseries}{\thesubsubsection}{1em}{}
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.pos = "H", results = 'asis')
+options(knitr.table.format = "pdf")
+```
+
+```{r library-load, include = FALSE, echo = FALSE}
+if (!require(caret)) install.packages('caret')
+library(caret)
+
+if (!require(kableExtra)) install.packages('kableExtra')
+library(kableExtra) # Guidance taken from here: https://cran.r-project.org/web/packages/kableExtra/vignettes/awesome_table_in_pdf.pdf
+
+if (!require(knitr)) install.packages('knitr')
+library(knitr)
+
+if (!require(rpart)) install.packages('rpart')
+library(rpart)
+
+if (!require(rpart.plot)) install.packages('rpart.plot')
+library(rpart.plot) # Guidance taken from here: http://www.milbo.org/doc/prp.pdf
+
+if (!require(stringr)) install.packages('stringr')
+library(stringr)
+
+if (!require(tidyverse)) install.packages('tidyverse')
+library(tidyverse)
+
+if (!require(xgboost)) install.packages('xgboost')
+library(xgboost)
+```
+
+```{r loading-datasets, echo = FALSE, include = FALSE}
+# Download the dataset - method used in Movielens project 
+
+# The dataset used for this report (Glioma Grading Clinical and Mutation Features) can be found here:
+
+#Website and more info on dataset: https://archive.ics.uci.edu/dataset/759/glioma+grading+clinical+and+mutation+features+dataset
+
+#Research paper citation: Tasci, E.; Zhuge, Y.; Kaur, H.; Camphausen, K.; Krauze, A.V.
+# Hierarchical Voting-Based Feature Selection and Ensemble Learning Model Scheme for Glioma Grading with Clinical and Molecular Characteristics. 
+#Int. J. Mol. Sci. 2022, 23, 14155.
+#https://www.semanticscholar.org/reader/992bf4c0b92ef251644ac2854dd1baacd7e42dc5
+
+webfiles <- "glioma+grading+clinical+and+mutation+features+dataset.zip" # Name the file for the environment
+if(!file.exists(webfiles))
+  download.file("https://archive.ics.uci.edu/static/public/759/glioma+grading+clinical+and+mutation+features+dataset.zip", webfiles)
+
+# There are two files - one where each column has actual data recorded (in this case e.g. female or male, and NOT_MUTATED or MUTATED), and one with binary categorical values encoded as 1 or 0.
+
+info_with_grade <- "TCGA_InfoWithGrade.csv" # File where some columns have been removed and binary variables have been encoded 1 or 0
+if(!file.exists(info_with_grade))
+  unzip(webfiles, info_with_grade)
+
+mutations_all <- "TCGA_GBM_LGG_Mutations_all.csv" # Original dataset
+if(!file.exists(mutations_all))
+  unzip(webfiles, mutations_all)
+
+minimal_dataset <- read.csv(info_with_grade)
+all_info_dataset <- read.csv(mutations_all)
+```
+
+------------------------------------------------------------------------------   
+
+# Overview
+The dataset that is used for this project is called "Glioma Grading Clinical and Mutation Features" and was accessed [via the UC Irvine Machine Learning Repository](https://archive.ics.uci.edu/dataset/759/glioma+grading+clinical+and+mutation+features+dataset). The aim of this project is to find the fewest features possible to accurately predict whether a glioma is a Lower-Grade Glioma (LGG) or a Glioblastoma Multiforme (GBM).   
+
+
+The fewest possible number of features is desired as molecular testing is expensive - most of the features in the dataset are "molecular features" that are either mutated, or not. Each molecular feature will be costly to test for mutations. We want to achieve a high accuracy, but still try to save on testing resources.    
+
+
+A [research paper by Tasci et. al](https://www.semanticscholar.org/reader/992bf4c0b92ef251644ac2854dd1baacd7e42dc5) using this dataset had a similar aim; minimal features and maximum accuracy. The research team used both feature selection methodologies (one novel methodology developed by the team) and ensemble modelling. They achieved an accuracy of 87.606% - we will aim for this and see how we do with our own models.   
+
+
+Two files are available from the repository: the original dataset (862 observations), and a preprocessed file (839 observations). We will use the preprocessed file - the preprocessing steps are described as follows by the donors of the dataset:   
+
+
+>*"The original and preprocessed files differ in the following ways:*
+>
+>  * *There are 23 instances in the original file where Gender, Age_at_diagnosis, or Race feature values are ‘--’, or ‘not reported’. These instances were filtered out in the preprocessed dataset.* 
+>  * *Despite being present in the original dataset, we do not include the columns Project, Case_ID, and Primary_Diagnosis columns in the preprocessed dataset.*
+>  * *Age_at_diagnosis feature values were converted from string to continuous value by adding day information to the corresponding year information in the dataset as a floating-point number for the preprocessing stage."*
+>
+>*"Below is a list of the additional columns of the original dataset file (and their corresponding description):*
+>
+>  * *Project column represents corresponding TCGA-LGG or TCGA-GBM project names.*
+>  * *Case_ID column refers to the related project Case_ID information.*
+>  * *Primary_Diagnosis column provides information related to the type of primary diagnosis."*
+
+\newpage
+
+To keep things clear, this table shows what has happened to each column in the original file during preprocessing:    
+
+
+```{r table-variables-reference, echo = FALSE}
+table_variables_reference <- data.frame(Variable = c(rep("Grade", 2), "Project", "Case_ID", rep("Gender", 2), "Age_at_diagnosis", "Primary_Diagnosis", rep("Race", 4), rep("All columns representing molecular features", 2)),
+                             Key = c("0 = LGG", "1 = GBM", "Removed", "Removed", "0 = Male", "1 = Female", "Converted from string to continuous value", "Removed", "0 = white", "1 = black or african American", "2 = asian", "3 = american indian or alaska native", "0 = NOT_MUTATED", "1 = MUTATED"))
+
+kbl(table_variables_reference, booktabs = TRUE, escape = TRUE, caption = "Changes made to variables of original dataset in minimal dataset") %>% 
+  kable_styling(latex_options = "HOLD_position") %>% 
+  collapse_rows(columns = 1, latex_hline = "major", row_group_label_position = "first")
+```
+
+\newpage
+
+# Data exploration
+
+In order to better understand the dataset and also aid our decision making for feature and model selection, we do a deep dive into the dataset. We start by looking at the distribution of the different feature variables across the dataset, and then look at their relationship with our target variable, Grade.   
+
+## Distibution of data
+
+```{r table-gender-summary, echo = FALSE}
+table_summary_gender <- minimal_dataset %>% 
+  mutate(Gender = ifelse(Gender == 0, "Male", "Female")) %>%
+  group_by(Gender) %>% 
+  summarize(Count = n()) %>% 
+  mutate(Percent = round(Count/sum(Count)*100, 2))
+
+kbl(table_summary_gender, booktabs = TRUE, caption = "Distribution of gender in the minimal dataset") %>% 
+  kable_styling(full_width = TRUE, latex_options = c("scale_down","HOLD_position")) %>% 
+  column_spec(1, width = "7cm")
+```
+The distribution between female and male appears to be relatively even, with male being slightly overrepresented.  
+
+  
+  
+```{r table-summary_race, echo = FALSE}
+table_summary_race <- minimal_dataset %>% 
+  mutate(Race = str_replace_all(Race, c("0" = "White", "1" = "Black or African American", "2" = "Asian", "3" = "American Indian or Alaska Native"))) %>%
+  group_by(Race) %>% 
+  summarize(Count = n()) %>% 
+  mutate(Percent = round(Count/sum(Count)*100, 2))
+
+kbl(table_summary_race, booktabs = TRUE, caption = "Distribution of race in the minimal dataset") %>% 
+  kable_styling(full_width = TRUE, latex_options = "HOLD_position") %>% 
+  column_spec(1, width = "7cm")
+```
+Over 90 percent of the data points belong to the race "white" - this means that race as a feature in this dataset will need to be used with caution, as the numbers for other races are low. It will also be difficult to divide the dataset into train and test sets while keeping the datasets even and representative, since there is only one American Indian or Alaska Native	in the dataset and not many cases in the other categories either.  
+  
+  
+```{r table-summary-grade, echo = FALSE}
+table_summary_grade <- minimal_dataset %>% 
+  mutate(Grade = ifelse(Grade == 0, "LGG", "GBM")) %>% 
+  group_by(Grade) %>% 
+  summarize(Count = n()) %>% 
+  mutate(Percent = round(Count/sum(Count)*100, 2))
+
+kbl(table_summary_grade, booktabs = TRUE, caption = "Distribution of grade in the minimal dataset") %>% 
+  kable_styling(full_width = TRUE, latex_options = "HOLD_position") %>% 
+  column_spec(1, width = "7cm")
+```
+The grade variable, like gender, seems to be relatively evenly distributed across the dataset, with LGG slightly more common.  
+  
+  
+```{r table-summary-age, echo = FALSE}
+table_summary_age <- minimal_dataset %>% 
+  summarize(Mean = round(mean(Age_at_diagnosis), 0), Median = round(median(Age_at_diagnosis), 0), Youngest = round(min(Age_at_diagnosis), 0), Oldest = round(max(Age_at_diagnosis), 0))
+
+table_summary_age_long <- pivot_longer(table_summary_age, cols = everything(), names_to = "Statistic", values_to = "Value")
+
+kbl(table_summary_age_long, booktabs = TRUE, caption = "Distribution of age at diagnosis in the minimal dataset") %>% 
+  kable_styling(full_width = TRUE, latex_options = "HOLD_position") %>% 
+  column_spec(1, width = "7cm")
+```
+There is a fairly wide spread of ages in the dataset, which the table does not quite tell enough about. Plotting the spread of ages may be more informative:  
+```{r plot-distribution-age, echo = FALSE}
+minimal_dataset %>% ggplot(aes(x = Age_at_diagnosis)) + 
+  geom_histogram(aes(y = stat(density)), binwidth = 1, fill = "grey") + 
+  geom_density(colour = "violet", linewidth = 1) + 
+  theme_bw() +
+  labs(x = "Age at diagnosis", y = "Density", title = "Distribution of Age at Diagnosis") + 
+  scale_x_continuous(breaks = c(20, 30, 40, 50, 60, 70, 80, 90, 100))
+```
+There appears to be a dip in the age distribution around age 45, somewhat dividing the age groups into two. This could mean that age at diagnosis may be useful for prediction, but we need more information before we can draw this conclusion.
+
+```{r table-grade-mol-feats, echo = FALSE}
+table_mol_feats <- minimal_dataset %>% mutate(Grade = ifelse(Grade == 0, "LGG", "GBM")) %>% 
+  pivot_longer(cols = 5:ncol(minimal_dataset), names_to = "mol_feats", values_to = "mol_feats_y_n") %>% # Create column with feature names and column indicating if mutated (1) or not (0)
+  group_by(mol_feats, Grade) %>% 
+  summarize(Count = sum(mol_feats_y_n), .groups = "keep")
+```
+
+```{r plot-mol-feats-distribution, echo = FALSE}
+table_plot_mol_feats <- table_mol_feats %>% 
+  group_by(mol_feats) %>% 
+  summarize(Total = sum(Count))
+
+table_plot_mol_feats %>% 
+  ggplot(aes(x = reorder(mol_feats, -Total), y = Total, fill = mol_feats)) +
+  geom_col(show.legend = FALSE) +
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_line(color = "grey90"),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+  ) +
+  labs(x = "Molecular Feature", y = "Total Number of Mutation Occurrences", title = "Distribution of Molecular Features")
+```
+We can see that some mutations are much more common than others. In order for our models to be relevant, it would seem logical to focus on features that are likely to be present in the majority of glioma cases.  
+
+\newpage  
+## The relationships of the Grade variable and the features
+
+It will also be useful to study the relationships between the Grade variable, which will be the target variable in our model, and the feature variables.  
+```{r table-gender-grade, echo = FALSE}
+table_gender_grade <- minimal_dataset %>% 
+  mutate(Gender = ifelse(Gender == 0, "Male", "Female"), Grade = ifelse(Grade == 0, "LGG", "GBM")) %>% 
+  group_by(Grade, Gender) %>% 
+  summarize(Count = n(), .groups = "keep") %>%
+  group_by(Gender) %>%
+  summarize(Grade = Grade, Count = Count, Percent = round(Count/sum(Count)*100, 1), .groups = "keep")
+```
+
+```{r plot-gender-grade, echo = FALSE}
+table_gender_grade %>% ggplot(aes(x = Grade, y = Count, fill = Grade), show.legend = FALSE) +
+  geom_col(show.legend = FALSE) +
+  geom_text(data = table_gender_grade, aes(label = paste(Percent, "%"), vjust = -0.5)) + 
+  labs(title = "Grade Distribution for Different Genders") +
+  theme_bw() +
+  facet_grid(. ~ Gender)
+```
+Starting with the Gender variable, it appears that there is a slightly bigger difference in Grade for females than males, but the difference is fairly small. Nevertheless, Gender may be a useful in predicting Grade to some extent.  
+  
+  
+```{r table-race-grade, echo = FALSE}
+table_race_grade <- minimal_dataset %>% 
+  mutate(Race = str_replace_all(Race, c("0" = "White", "1" = "Black or African American", "2" = "Asian", "3" = "American Indian or Alaska Native"))) %>%
+  mutate(Grade = ifelse(Grade == 0, "LGG", "GBM")) %>%
+  group_by(Grade, Race) %>%
+  summarize(Count = n(), .groups = "keep") %>%
+  group_by(Race) %>%
+  summarize(Grade = Grade, Count = Count, Percent = round(Count/sum(Count)*100, 1), .groups = "keep")
+```
+
+```{r plot-race-grade, echo = FALSE}
+table_race_grade %>% ggplot(aes(x = Grade, y = Count, fill = Grade), show.legend = FALSE) +
+  geom_col(show.legend = FALSE) +
+  geom_text(data = table_race_grade, aes(label = paste(Percent, "%"), vjust = -0.5)) + 
+  scale_y_log10() +
+  theme_bw() +
+  facet_grid(. ~ Race) +
+  labs(title = "Grade distribution for different races")
+```
+When looking at the Race variable, it is important to remember that the majority of the dataset belongs to the same race (white). The apparent difference in proportion of Grade for black or African american compared to white and Asian may be a true difference, but since the sample size here is very small (59 total cases compared to 795 for white) it needs to be interpreted with caution.  
+  
+  
+```{r plots-grade-mol-feats, echo = FALSE}
+table_mol_feats %>% ggplot(aes(x = Grade, fill = Grade)) +
+  geom_col(aes(y = Count), show.legend = FALSE) +
+  theme_bw() +
+  facet_wrap(~ mol_feats) +
+  labs(y = "Number of cases with mutation present", title = "Mutation prescence in different glioma grades by each molecular features") + 
+  scale_y_log10()
+```
+Some molecular features show larger differences than others between mutated or not mutated, but this is a log scale - let's see where the biggest real differences are:  
+
+```{r table-diff-mol-feat, echo = FALSE}
+table_diff_mol_feats <- table_mol_feats %>% 
+  pivot_wider(names_from = Grade, values_from = Count) %>% 
+  mutate(Diff = abs(LGG - GBM), Pct_diff = round(Diff/(LGG + GBM)*100, 2)) %>% arrange(desc(Pct_diff))
+
+kbl(table_diff_mol_feats, escape = TRUE, booktabs = TRUE, caption = "Differences in presence of mutation of molecular features in cases of LGG and GBM") %>%
+  kable_styling(full_width = TRUE, latex_options = "HOLD_position") %>% 
+  column_spec(1, width = "7cm")
+```
+The molecular features for which there is a large difference in presence of mutation between the two grades may be more important features for building a predictive model. In this case the biggest difference between grades appears to be the molecular feature NOTCH1 - this does not seem to be a very common mutation, however.  
+
+\newpage
+
+We can look at the table again with only mutations that occur at least 100 times in the dataset:  
+
+```{r table-diff-mol-feat-most-common, echo = FALSE}
+table_diff_mol_feats %>% filter((GBM+LGG) > 100) %>% 
+  kbl(booktabs = TRUE, caption = "Differences in presence of mutation of most common molecular features in cases of LGG and GBM") %>% 
+  kable_styling(full_width = TRUE, latex_options = "HOLD_position") %>% 
+  column_spec(1, width = "7cm")
+```
+Features that may be very useful to us, since they appear to be relatively common and also have a big difference in mutation between GBM and LGG, are CIC, IDH1, ATRX and PTEN. IDH1 is the most commonly mutated feature and therefore it will probably be the most useful. PTEN is the only feature of the ones above that is more commonly mutated in GMB than LGG, which could also be useful.  
+
+\newpage
+
+Let's also look at age at diagnosis:   
+
+```{r plot-age-grade, echo = FALSE}
+minimal_dataset %>% 
+  mutate(Grade = ifelse(Grade == 0, "LGG", "GBM")) %>%
+  ggplot(aes(x = Grade, y = Age_at_diagnosis, fill = Grade)) +
+  geom_boxplot(show.legend = FALSE) +
+  theme_bw() + 
+  labs(y = "Age at Diagnosis", title = "Age at diagnosis for LGG and GBM grades") +
+  scale_y_continuous(breaks = c(10, 20, 30, 40, 50, 60, 70, 80, 90, 100))
+```
+There is only a small overlap of the interquartile ranges, so there may be something in age at diagnosis being a useful predictor of grade.  
+
+We have looked at all of the different features now - some seem to hold more information than others. We will further look into which features will be most useful to us when we build our models.
+
+------------------------------------------------------------------------------    
+
+\newpage
+# Method
+
+## Create train and test sets from the minimal_dataset
+
+To gain some more insight into data partition in the context of smaller datasets and medical data, the internet was consulted. In [their blog]((https://glassboxmedicine.com/2019/09/15/best-use-of-train-val-test-splits-with-tips-for-medical-data/)), Draelos describes the need to ensure that the data is split by patient, not by encounter - as if the same patient appears twice, their data will be highly correlated. We can check the original file for any duplicates by checking the CaseId:
+
+```{r check-duplicate-case, echo = FALSE}
+table_length_Case_ID <- data.frame(Length_unique = length(unique(all_info_dataset$Case_ID)), # Length of unique Case_IDs
+                                   Length_all = length(all_info_dataset$Case_ID)) # Length of whole Case_ID variable
+
+kbl(table_length_Case_ID, booktabs = TRUE, caption = "Comparing length of unique CaseId and all CaseId in unprocessed dataset") %>% kable_styling(latex_options = "HOLD_position")
+```
+The unique values and the full vector length are the same, so there should not be any patients included more than once.  
+
+The suggestion from the dataset donors is also to use cross-validation for small datasets rather than a train-validation-test setup, as creating both validation and test sets will make each set too small to be useful. We will work cross-validation into our models where possible - the dataset creators suggest 10-fold cross-validation.  
+
+There are many suggestions out there on test-train splits, the most common seemingly being 80-20 and 70-30. Since the dataset is relatively small, we will go for 70-30 to try to obtain sets that are broadly representative of the whole dataset.  
+
+```{r create-train-and-test-sets, echo = TRUE}
+set.seed(1) # Set seed for reproducibility
+minimal_dataset$Grade <- ifelse(minimal_dataset$Grade == 0, "LGG", "GBM") # Change back to abbreviations for interpretability
+minimal_dataset$Grade <- factor(minimal_dataset$Grade) # Turn into factor for model building
+
+test_index <- createDataPartition(y = minimal_dataset$Grade, times = 1, p = 0.3, list = FALSE) # Create index for 30 percent of data
+
+train_set <- minimal_dataset[-test_index, ] # Select rows not in test index (70 percent of data)
+test_set <- minimal_dataset[test_index, ] # Select rows in test index (30 percent of data)
+```
+
+```{r check-distribution-train-test, echo = FALSE}
+train_for_tab <- train_set %>% 
+  group_by(Grade) %>% 
+  summarize(Count = n()) %>% 
+  ungroup() %>% 
+  mutate(Set = c(rep("Train", 2)), Percent = round(Count/sum(Count)*100, 1))
+
+test_for_tab <- test_set %>% 
+  group_by(Grade) %>% 
+  summarize(Count = n()) %>% 
+  ungroup() %>% 
+  mutate(Set = c(rep("Test", 2)), Percent = round(Count/sum(Count)*100, 1))
+
+full_for_tab <- minimal_dataset %>% 
+  group_by(Grade) %>% 
+  summarize(Count = n()) %>% 
+  ungroup() %>% 
+  mutate(Set = c(rep("Full", 2)), Percent = round(Count/sum(Count)*100, 1))
+
+table_train_test <- rbind(full_for_tab, train_for_tab, test_for_tab) %>% 
+  relocate(Set, .before = Grade)
+
+kbl(table_train_test, booktabs = TRUE, caption = "Distribution of the Grade variable across training and test sets compared to full dataset") %>% 
+  collapse_rows(columns = 1, latex_hline = "major", row_group_label_position = "first") %>%
+  kable_styling(full_width = TRUE, latex_options = "HOLD_position") %>% 
+  column_spec(1, width = "7cm")
+
+rm(test_index, train_for_tab, test_for_tab, full_for_tab)
+```
+It seems like the sets have been divided roughly equally with regards to Grade. The function createDataPartition which was used is built to create balanced splits, so the check above reassures us that it works reasonably here.    
+
+\newpage
+
+## Model testing
+
+### Decision Tree model with rpart
+
+As most of our variables are binary, a decision tree approach may fit the data well. We have seen that some molecular features are mutated more or less frequently for the two different glioma grades, so there may be some easy decisions that can be made using some of the molecular features. We test the rpart model to build a decision tree using all features as a starting point:    
+
+```{r model-decision-tree, echo = FALSE}
+# Set up the model 
+set.seed(1)
+model_rpart <- train(Grade ~ . , 
+                     method = "rpart", 
+                     data = train_set,
+                     tuneGrid = data.frame(cp = seq(0, 0.1, len = 50)), # Grid search for best cp
+                     trControl = trainControl(method = "cv", number = 10) # 10-fold cross validation
+                     )
+
+# Predict on test set
+pred_rpart <- predict(model_rpart, test_set)
+
+# Save accuracy and feature importance
+acc_rpart <- mean(pred_rpart == test_set$Grade) # Find model accuracy
+imp_rpart <- varImp(model_rpart, scale = TRUE) # Find importance of different features
+```
+
+```{r plot-model-rpart, echo = FALSE}
+# Plot the decision tree
+rpart.plot(model_rpart$finalModel, extra = "auto", box.palette = "BlGnYl")
+```
+This is interesting - like we suspected when exploring the data, IDH1 is an important feature, and a relatively common mutation from what we can tell from the dataset. IDH2, which is not very commonly mutated (23 in total) came up as significant for the second split in the tree - while potentially useful, this needs to be treated with caution, as it is perhaps unlikely to be present in a large number of cases in the real world.  
+
+```{r plot-acc-rpart, echo = FALSE}
+# Plot accuracy vs complexity parameter (cp)
+plot(model_rpart)
+```
+Accuracy and confusion matrix for the rpart model:
+```{r table-conf-mat-rpart, echo = FALSE}
+# Confusion matrix for rpart tree model
+kbl(acc_rpart, booktabs = TRUE, col.names = NULL) %>% kable_styling(latex_options = "HOLD_position", position = "left")
+
+conf_mat_rpart <- confusionMatrix(pred_rpart, test_set$Grade)
+
+kbl(conf_mat_rpart$table, booktabs = F) %>% 
+  kable_styling(latex_options = "HOLD_position", position = "left") %>%
+  add_header_above(c("Prediction", "Reference" = 2))
+```
+The accuracy we get with this model is actually not bad, `r acc_rpart`. We can see from the confusion matrix below that the sensitivity is quite high, while the specificity is slightly lower. Compared to the ensemble models that [Tasci et. al](https://www.semanticscholar.org/reader/992bf4c0b92ef251644ac2854dd1baacd7e42dc5) created, this is actually pretty good - but we are still using all of our 23 features, and we want to achieve this level of accuracy with fewer than this.  
+
+```{r plot-imp-rpart, echo = FALSE}
+plot(imp_rpart, main = "Importance of Features")
+```
+Looking at the most important features, we can see that as expected IDH1 comes out on top. For this model, only seven out of the total 23 features appears to have any importance at all. 
+
+### Random forest model
+
+While decision trees are lovely and simple to interpret, they can be prone to overfitting. There are however machine learning models that can produce more robust results, such as the random forest model. This is also a tree-based model, but it combines many different decision trees to obtain a result, essentially a form of ensemble modelling.  
+
+```{r model-random-forest, echo = FALSE, cache = TRUE}
+
+# Set up random forest model
+set.seed(1)
+model_rf <- train(Grade ~ . , 
+                     method = "rf", 
+                     data = train_set,
+                     tuneGrid = data.frame(mtry = seq(1, 5, 1)), # Grid search for best mtry
+                     trControl = trainControl(method = "cv", number = 10) # 10-fold cross validation
+                     )
+
+# Predict on test set
+pred_rf <- (predict(model_rf, test_set))
+
+# Save accuracy and feature importance
+acc_rf <-  mean(pred_rf == test_set$Grade) # Find model accuracy
+imp_rf <- varImp(model_rf, scale = TRUE) # Find importance of different features
+
+```
+
+```{r plot-model-random-forest, echo = FALSE}
+plot(model_rf)
+```
+Accuracy and confusion matrix for the random forest model:
+```{r table-conf-mat-random-forest, echo = FALSE}
+# Confusion matrix for random forest model
+kbl(acc_rf, booktabs = TRUE, col.names = NULL) %>% kable_styling(latex_options = "HOLD_position", position = "left")
+
+conf_mat_rf <- confusionMatrix(pred_rf, test_set$Grade)
+
+kbl(conf_mat_rf$table, booktabs = F) %>% 
+  kable_styling(latex_options = "HOLD_position", position = "left") %>% 
+  add_header_above(c("Prediction", "Reference" = 2))
+```
+We can see that the more features are chosen, the less accurate the model becomes - this makes sense as we saw in the tree model earlier how most features have little to no predictive value.   
+
+\newpage
+
+The random forest model also allows for the feature importance to be examined:   
+
+```{r plot-imp-random-forest, echo = FALSE}
+plot(imp_rf)
+```
+This model certainly implies that some features are less important, but unlike the rpart tree model it does seem to assign some importance to all of the features, albeit small. IDH2 is given less importance in this model, similarly to when we looked at the differences between the molecular features during data exploration.   
+
+### XGboost model
+
+It may be useful to try another model - the xgboost model is an ["optimized distributed gradient boosting library"](https://xgboost.readthedocs.io/en/stable/index.html) . Simply speaking, "gradient boosting" is a machine learning technique which learns from previous mistakes - for every round that the algorithm runs, it builds a new model which is an improvement from previous ones. The final output is an ensemble of all of the models, weighted by how much each model can reduce prediction error.  
+
+```{r model-xgboost, echo = FALSE, cache = TRUE}
+# Define tuning grid
+#Run once to find best tune - the one below is used after as it takes a while to run with all parameters optimising
+# tune_grid <- expand.grid(nrounds = 100,
+#                          max_depth = c(3, 6, 9), # Depth of a tree - high values may lead to overfitting
+#                          eta = c(0.01, 0.1, 0.3), # Controls contribution of each tree to overall ensemble - low values require more rounds to achieve results
+#                          gamma = c(0, 0.1, 0.2), # Minimum loss required to create new node
+#                          colsample_bytree = c(0.7, 0.8, 0.9), # Fraction of features to consider when building tree - low value can reduce overfitting
+#                          min_child_weight = c(1, 2), # Controls if node is split based on size - high values makes model more conservative
+#                          subsample = c(0.7, 0.8, 0.9) # Fraction of rows to consider when building tree - low value can reduce overfitting
+# )
+#
+#model_xgboost$bestTune
+
+# Tune grid with best tune
+tune_grid <-  expand.grid(nrounds = 200,
+                         max_depth = 3, # Depth of a tree - high values may lead to overfitting
+                         eta = 0.01, # Controls contribution of each tree to overall ensemble - low values require more rounds to achieve results
+                         gamma = 0, # Minimum loss required to create new node
+                         colsample_bytree = 0.8, # Fraction of features considered when building tree - low value can reduce overfitting
+                         min_child_weight = 2, # Controls if node is split based on size - high values makes model more conservative
+                         subsample = 0.7 # Fraction of rows considered when building tree - low value can reduce overfitting
+)
+
+
+# Define train control options
+train_control <- trainControl(method = "cv", number = 10, # 10-fold cross-validation
+                              verboseIter = FALSE, # Don't print progress to console
+                              classProbs = TRUE, # Compute class probabilities
+                              summaryFunction = twoClassSummary # As target variable is binary
+)
+# Set up xgboost model
+set.seed(1)
+model_xgboost <- train(Grade ~ . , 
+                     method = "xgbTree", 
+                     data = train_set,
+                     tuneGrid = tune_grid, 
+                     trControl = train_control
+)
+
+# Predict on test set
+pred_xgboost <- predict(model_xgboost, test_set)
+
+# Save accuracy and feature importance
+acc_xgboost <- mean(pred_xgboost == test_set$Grade) # Find model accuracy
+imp_xgboost <- varImp(model_xgboost, scale = TRUE)  # Find importance of different features
+
+
+```
+
+\newpage
+
+Accuracy and confusion matrix for the xgboost model:
+```{r table-conf-mat-xgboost, echo = FALSE}
+# Confusion matrix for xgboost model
+kbl(acc_xgboost, booktabs = TRUE,col.names = NULL, position = "left")
+
+conf_mat_xgboost <- confusionMatrix(pred_xgboost, test_set$Grade)
+
+kbl(conf_mat_xgboost$table, booktabs = F) %>% 
+  kable_styling(latex_options = "HOLD_position", position = "left") %>%
+  add_header_above(c("Prediction", "Reference" = 2))
+```
+The accuracy we get with this model is quite good, but similar to the other models.
+
+```{r plot-imp-xgboost, echo = FALSE}
+plot(imp_xgboost)
+```
+Plotting the importance of the features again confirms that IDH1 is the most important feature, followed by age at diagnosis.
+
+\newpage
+  
+## Feature selection
+
+After running three different models, it is clear that IDH1 is the most important feature. However, relying on just one feature will probably not give us a very high accuracy. After all, Tasci et al. actually used 15 (14.9) features to get their results. 
+
+Another thing we can do to help us decide on features for our model is to check for features with near-zero variance, in other words where there is very little or no information provided by a feature. The caret package has a function for this called nearZeroVar - we run this function on the minimal dataset and extract the names of the features that it identifies:  
+
+```{r table-non-zero-variables, echo = FALSE}
+nzv <- nearZeroVar(minimal_dataset)
+
+minimal_dataset[nzv] %>% colnames() %>% kbl(booktabs = TRUE, col.names = NULL, caption = "Features with near-zero variance") %>% kable_styling(latex_options = "HOLD_position")
+```
+These variables have very little variation and is therefore deemed by the function to be unlikely to be significant for us - however, IDH2 is on this list, which was significant for the decision rpart tree model. We clearly need to be careful in dismissing features as not useful based on their variance.  
+
+We can do a very simplified voting system, not as advanced as the one that Tasci et al. created for feature selection but it will have to do. Let's take the top five features of each model and see where we end up:   
+
+```{r table-feature-selection, echo = FALSE, results='asis'}
+top_five_rpart <- top_n(data.frame(imp_rpart$importance), 5)
+top_five_rpart <- arrange(top_five_rpart, desc(Overall))
+
+top_five_rf <- top_n(data.frame(imp_rf$importance), 5)
+top_five_rf <- arrange(top_five_rf, desc(Overall))
+
+top_five_xgboost <- top_n(data.frame(imp_xgboost$importance), 5)
+top_five_xgboost <- arrange(top_five_xgboost, desc(Overall))
+
+trpart <- kbl(top_five_rpart, booktabs = TRUE, caption = "rpart model top five features") %>% kable_styling(latex_options = "HOLD_position")
+
+trf <- kbl(top_five_rf, booktabs = TRUE, caption = "random forest model top five features") %>% kable_styling(latex_options = "HOLD_position")
+
+txgboost <- kbl(top_five_xgboost, booktabs = TRUE, caption = "xgboost model top five features") %>% kable_styling(latex_options = "HOLD_position")
+
+aligned_tables <- paste0("
+\\begin{minipage}[t]{0.32\\textwidth}
+", trpart, "
+\\end{minipage}
+\\hfill
+\\begin{minipage}[t]{0.32\\textwidth}
+", trf, "
+\\end{minipage}
+\\hfill
+\\begin{minipage}[t]{0.32\\textwidth}
+", txgboost, "
+\\end{minipage}
+")
+
+knitr::asis_output(aligned_tables)
+```
+
+Let's include all of the features in the tables above - this gives us:  
+
+* IDH1
+* Age_at_diagnosis
+* CIC
+* ATRX
+* PTEN
+* IDH2
+* NF1
+
+\newpage
+## Re-running models with fewer features
+
+Let's see how our models work with the selected features.
+```{r model-rpart-top-pred, echo = FALSE, cache = TRUE}
+# Set up the model 
+set.seed(1)
+model_rpart_top <- train(Grade ~ IDH1 + Age_at_diagnosis + CIC + ATRX + PTEN + IDH2 + NF1, 
+                     method = "rpart", 
+                     data = train_set,
+                     tuneGrid = data.frame(cp = seq(0, 0.1, len = 50)), # Grid search for best cp
+                     trControl = trainControl(method = "cv", number = 10) # 10-fold cross validation
+                     )
+
+# Predict on test set
+pred_rpart_top <- predict(model_rpart_top, test_set)
+
+# Save accuracy
+acc_rpart_top <- mean(pred_rpart_top == test_set$Grade) # Find model accuracy
+```
+
+```{r model-random-forest-top, echo = FALSE, cache = TRUE}
+# Set up random forest model
+set.seed(1)
+model_rf_top <- train(Grade ~ IDH1 + Age_at_diagnosis + CIC + ATRX + PTEN + IDH2 + NF1, 
+                     method = "rf", 
+                     data = train_set,
+                     tuneGrid = data.frame(mtry = seq(1, 5, 1)), # Grid search for best mtry
+                     trControl = trainControl(method = "cv", number = 10) # 10-fold cross validation
+                     )
+
+# Predict on test set
+pred_rf_top <- (predict(model_rf_top, test_set))
+
+# Save accuracy
+acc_rf_top <- mean(pred_rf_top == test_set$Grade) # Find model accuracy
+
+```
+
+```{r model-xgboost-top, echo = FALSE, cache = TRUE}
+# Define tuning grid
+#Run once to find best tune - the one below is used after as it takes a while to run with all parameters optimising
+# tune_grid <- expand.grid(nrounds = 100,
+#                          max_depth = c(3, 6, 9), # Depth of a tree - high values may lead to overfitting
+#                          eta = c(0.01, 0.1, 0.3), # Controls contribution of each tree to overall ensemble - low values require more rounds to achieve results
+#                          gamma = c(0, 0.1, 0.2), # Minimum loss required to create new node
+#                          colsample_bytree = c(0.7, 0.8, 0.9), # Fraction of features to consider when building tree - low value can reduce overfitting
+#                          min_child_weight = c(1, 2), # Controls if node is split based on size - high values makes model more conservative
+#                          subsample = c(0.7, 0.8, 0.9) # Fraction of rows to consider when building tree - low value can reduce overfitting
+# )
+#
+#model_xgboost_top$bestTune
+
+# Tune grid with best tune
+tune_grid <-  expand.grid(nrounds = 200,
+                         max_depth = 6, # Depth of a tree - high values may lead to overfitting
+                         eta = 0.01, # Controls contribution of each tree to overall ensemble - low values require more rounds to achieve results
+                         gamma = 0.2, # Minimum loss required to create new node
+                         colsample_bytree = 0.9, # Fraction of features considered when building tree - low value can reduce overfitting
+                         min_child_weight = 2, # Controls if node is split based on size - high values makes model more conservative
+                         subsample = 0.7 # Fraction of rows considered when building tree - low value can reduce overfitting
+)
+
+
+# Define train control options
+train_control <- trainControl(method = "cv", number = 10, # 10-fold cross-validation
+                              verboseIter = FALSE, # Don't print progress to console
+                              classProbs = TRUE, # Compute class probabilities
+                              summaryFunction = twoClassSummary # As target variable is binary
+)
+# Build the model
+set.seed(1)
+model_xgboost_top <- train(Grade ~ IDH1 + Age_at_diagnosis + CIC + ATRX + PTEN + IDH2 + NF1, 
+                     method = "xgbTree", 
+                     data = train_set,
+                     tuneGrid = tune_grid, 
+                     trControl = train_control
+)
+
+# Predict on test set
+pred_xgboost_top <- predict(model_xgboost_top, test_set)
+
+# Save accuracy
+acc_xgboost_top <- mean(pred_xgboost_top == test_set$Grade) # Find model accuracy
+```
+
+```{r table-accs-all-models, echo = FALSE}
+table_all_accs <- data.frame(Model = c("rpart - all features", "rpart - top features", "random forest - all features", "random forest - top features", "xgboost - all features", "xgboost - top features"), 
+                             Accuracy = c(acc_rpart, acc_rpart_top, acc_rf, acc_rf_top, acc_xgboost, acc_xgboost_top))
+table_all_accs <- arrange(table_all_accs, desc(Accuracy))
+
+kbl(table_all_accs, booktabs = TRUE, caption = "Accuracy of all models tested so far") %>% 
+  kable_styling(full_width = TRUE, latex_options = "HOLD_position") %>% 
+  column_spec(1, width = "7cm")
+```
+In summary, we can see that the models perform generally worse with the selected features than with all of them. Worth noting here is that several of the accuracies have come out exactly the same - this is likely due to the dataset being very small. This also puts into question how effective our cross-validation is, and whether the models will be scalable to larger datasets.
+
+## Ensemble model
+
+Tasci et al. used a number of different ensemble models in their work. Ensemble models can be more robust than single models, as they are able to take into account the strengths and weaknesses of different models to supposedly give a better prediction. We create a relatively simple version, a majority vote ensemble, and set it up as follows:
+
+```{r model-ensemble, echo = TRUE}
+# Majority voting ensemble
+ensemble_vote <- cbind(rpart = pred_rpart_top == "LGG",  rf = pred_rf_top == "LGG", xgboost = pred_xgboost_top == "LGG")
+
+# Predict on test set
+pred_ensemble_vote <- ifelse(rowMeans(ensemble_vote) >= 0.5, "LGG", "GBM")
+
+# Compute and save accuracy
+acc_ensemble_vote <- mean(pred_ensemble_vote == test_set$Grade)
+```
+
+------------------------------------------------------------------------------ 
+
+# Results
+
+```{r table-accs-all-models-with-ensemble, echo = FALSE}
+table_all_accs <- data.frame(Model = c("rpart - all features", "rpart - top features", "random forest - all features", "random forest - top features", "xgboost - all features", "xgboost - top features", "Ensemble - voting with top features"), 
+                             Accuracy = c(acc_rpart, acc_rpart_top, acc_rf, acc_rf_top, acc_xgboost, acc_xgboost_top, acc_ensemble_vote))
+table_all_accs <- arrange(table_all_accs, desc(Accuracy))
+
+kbl(table_all_accs, booktabs = TRUE, caption = "Accuracy of all models tested including ensemble model") %>% 
+  kable_styling(full_width = TRUE, latex_options = "HOLD_position") %>% 
+  column_spec(1, width = "7cm")
+```
+
+We can see that in this case ensembling of the models works pretty well - individually, the models with fewer features are generally outperformed by the ones with more features, but by creating an ensemble we are able to reach a pretty decent accuracy. And we have only used seven features (one of which, age at diagnosis, is "free"; the other six requires molecular testing), which has to be considered pretty good.  
+
+------------------------------------------------------------------------------ 
+
+\newpage
+
+# Conclusion   
+
+As concluded above, the models above work fairly well compared to the models by Tasci et al. that we set out to match. However, there are some issues that point to that the ensemble model that gave the best accuracy for this dataset may not work as well on another dataset:  
+
+ * The dataset is small, meaning there may be biases within it that are not applicable to a broader population
+ * The dataset mostly consists of white people - Tasci et al. had trouble applying their methods to a dataset with predominantly Chinese people, suggesting that there may be differences between different populations.
+ * The accuracies obtained from the different models are similar, and for some models identical. This can occur when the dataset is small and the outcome is binary, which is the case here. What this may mean is that the models are somewhat overfitted, or that there is a very clear trend in the dataset that all the models are picking up in the same way. If this trend is present in a larger population it may be fine, but it could also be a coincidence in this specific population.
+ 
+It would be interesting to use the ensemble model on a larger and more diverse dataset to see if it holds; I have not managed to obtain the dataset used by Tasci et al. for additional testing, but it would be interesting if this could be achieved in the future.
+
+# Final remarks
+
+I have used relatively simple methods to achieve the goal here - there are obvious limitations to how much a relative novice in data science can do. However, the learning along the way has been very valuable and I am looking forward to learning more about methods such as Singular Value Decomposition and other matrix related models, which I have yet to master to a level that made me confident to include them in this report. I also want to learn about other models and approaches that I have come across during this the data science programme in general and during this project in particular, such as Support Vector Machines and also other feature selection methods like recursive elimination.  
+
+------------------------------------------------------------------------------ 
+
+# Acknowledgements  
+
+The great people of the internet have certainly helped me in furthering my knowledge about different models, why my code doesn't work, and approaches to solving issues along the way. Forums like stackOverflow and similar websites have been very helpful.  
+
+I have used chatGPT for help on a few issues along the way, mostly code error related. I have found it a really useful tool in my learning and also a great moral support when I despair. I have included a full list of issues that I asked for chatGPTs input on in the appendix.
+
+------------------------------------------------------------------------------ 
+
+\newpage
+
+# Appendix
+
+## chatGPT queries and learning takeaways
+
+* Asked chatGPT for help when I struggled to get table-variables-reference to knit, as I couldn't find answers on any of the forums. chatGPT advised to shorten the very long row text for "Age_at_diagnosis" and also to add "escape = TRUE" to the kbl function.
+
+* Asked chatGPT about the createDataPartition function which was throwing an error, needed to include list = FALSE which I had missed.
+
+* Asked chatGPT why my code for turning Grade variable into its original labels and then into a factor didn't work, helped me fix my code where I was trying to use the pipe when not appropriate to do so.
+
+* Asked chatGPT why I couldn't find the variable importance for my rpart model - I was calling it wrong, varImp is a function, not an object within the model.
+
+* Asked chatGPT how to make my rpart importance table look nicer, since I couldn't figure out how to properly convert it to a data frame. I was doing it wrong by trying to convert the whole object rather than just the importance part of it. Now looks great with kable.
+
+* Asked chatGPT about the xgboost model and how it actually works, and what the different hyperparameters do in the model. This was not a model that was covered in the Data Science programme but I had come across it in my research on various forums, and wanted to test it out. I had a basic model built before asking chatGPT for help but was having trouble with understanding the hyperparameters, and was keen for the model to work with caret::train as I like the format.
+
+* Asked chatGPT to help me arrange my tables across the page in the Feature Selection section - learnt about latex minipages
